@@ -1,1 +1,568 @@
+FeatureScript 3029;
+import(path : "onshape/std/common.fs", version : "3029.0");
+import(path : "onshape/std/math.fs", version : "3029.0");
+//!UNDER CONTSTRUCTION!
+// ============================================================================
+// BOTTLE SPACING SCREW GENERATOR
+// ----------------------------------------------------------------------------
+// Generates a single-start, continuously variable-pitch helical screw used
+// in bottling conveyors to progressively increase spacing between adjacent
+// cylindrical bottles while keeping bottle acceleration continuous.
+//
+// This is NOT a timing/indexing screw adaptation. The flight pitch at every
+// axial position equals the local bottle spacing, and the spacing itself is
+// governed by a continuous transition law (linear / cubic / S-curve).
+//
+// ARCHITECTURE
+//   MODULE: TYPES         - enums / bound specs
+//   MODULE: MATH          - spacing law, numeric angle integration, blending
+//   MODULE: VALIDATION    - input sanity + manifold-safety checks
+//   MODULE: GEOMETRY      - shaft, flight cross-sections, loft, boolean union
+//   FEATURE DEFINITION    - UI (precondition) + orchestration (body)
+//
+// NOTE ON TESTING: this script is written to match Onshape FeatureScript
+// 2412 standard-library conventions, but has not been compiled inside an
+// Onshape Feature Studio from this environment. Before shipping, open it in
+// a Feature Studio, resolve any std-library signature drift (opLoft /
+// newSketchOnPlane / skRectangle argument names do shift slightly between
+// FS versions), and confirm regeneration on a range of inputs.
+// ============================================================================
+
+
+// ============================================================================
+// MODULE: TYPES
+// ============================================================================
+
+export enum TransitionLaw
+{
+    annotation { "Name" : "Linear" }
+    LINEAR,
+    annotation { "Name" : "Cubic (ease, C1 continuous)" }
+    CUBIC,
+    annotation { "Name" : "S-Curve (quintic, C2 continuous)" }
+    S_CURVE
+}
+
+// Custom bound specs. Kept local to this feature rather than reusing generic
+// std-library bounds, since a spacing screw has a meaningfully different
+// valid range than a general-purpose length field (e.g. we never want a
+// negative or zero screw length, and bottle diameters below ~5 mm or above
+// ~500 mm are certainly user error, not an exotic real design).
+
+export const SCREW_LENGTH_BOUNDS =
+{
+    (meter)      : [0.02, 0.5, 5.0],
+    (millimeter) : 500,
+    (inch)       : 20
+} as LengthBoundSpec;
+
+export const BOTTLE_DIAMETER_BOUNDS =
+{
+    (meter)      : [0.005, 0.07, 0.5],
+    (millimeter) : 70,
+    (inch)       : 2.75
+} as LengthBoundSpec;
+
+export const SPACING_BOUNDS =
+{
+    (meter)      : [0.005, 0.09, 1.0],
+    (millimeter) : 90,
+    (inch)       : 3.5
+} as LengthBoundSpec;
+
+export const CLEARANCE_BOUNDS =
+{
+    (meter)      : [0.0, 0.002, 0.05],
+    (millimeter) : 2,
+    (inch)       : 0.08
+} as LengthBoundSpec;
+
+export const OVERRIDE_LENGTH_BOUNDS =
+{
+    (meter)      : [0.001, 0.02, 0.5],
+    (millimeter) : 20,
+    (inch)       : 0.8
+} as LengthBoundSpec;
+
+
+// ============================================================================
+// MODULE: MATH
+// Pure numeric functions. No context, no geometry ops, fully unit testable
+// in isolation from the CAD kernel.
+// ============================================================================
+
+/** Clamp a unitless scalar into [lo, hi]. */
+function clampScalar(x is number, lo is number, hi is number) returns number
+{
+    return min(max(x, lo), hi);
+}
+
+/** Cubic ease (smoothstep). C1 continuous: zero slope at u = 0 and u = 1. */
+function smoothstepCubic(u is number) returns number
+{
+    const uc = clampScalar(u, 0, 1);
+    return 3 * uc^2 - 2 * uc^3;
+}
+
+/**
+ * Quintic smoothstep ("S-curve"). C2 continuous: zero slope AND zero
+ * curvature at u = 0 and u = 1. This is the standard jerk-limited motion
+ * profile shape -- used here because it guarantees continuous acceleration
+ * of the bottle across the entire screw, which is the actual engineering
+ * requirement behind "smooth bottle motion."
+ */
+function smoothstepQuintic(u is number) returns number
+{
+    const uc = clampScalar(u, 0, 1);
+    return 6 * uc^5 - 15 * uc^4 + 10 * uc^3;
+}
+
+/**
+ * Evaluates the bottle-spacing transition law at normalized axial position
+ * u in [0, 1]. The returned length IS the local flight pitch at that
+ * position -- one bottle spacing per revolution, single-start screw.
+ */
+function evaluateSpacing(u is number, initialSpacing is number, finalSpacing is number, law is TransitionLaw) returns number
+{
+    var shape = clampScalar(u, 0, 1); // LINEAR default
+    if (law == TransitionLaw.CUBIC)
+    {
+        shape = smoothstepCubic(u);
+    }
+    else if (law == TransitionLaw.S_CURVE)
+    {
+        shape = smoothstepQuintic(u);
+    }
+    return initialSpacing + (finalSpacing - initialSpacing) * shape;
+}
+
+/**
+ * Entry/exit blend envelope. Returns a unitless multiplier in [0, 1] that
+ * ramps 0 -> 1 over the first `blendFraction` of the length, holds at 1
+ * through the body, then ramps 1 -> 0 over the last `blendFraction`. Used
+ * to bring the flight height smoothly up from the shaft at the infeed and
+ * back down at the outfeed, instead of starting/ending the ribbon abruptly
+ * at full height (which would create a sharp, bottle-catching edge).
+ */
+function entryExitEnvelope(u is number, blendFraction is number) returns number
+{
+    const bf = clampScalar(blendFraction, 1e-6, 0.49);
+    if (u < bf)
+    {
+        return smoothstepQuintic(u / bf);
+    }
+    if (u > 1 - bf)
+    {
+        return smoothstepQuintic((1 - u) / bf);
+    }
+    return 1.0;
+}
+
+/**
+ * Result of integrating the variable-pitch helix angle along the screw.
+ * `stations` is an ordered array of maps: { u, z, theta, pitch }.
+ * `totalTurns` is informational / used to size loft resolution.
+ */
+export function buildStationTable(screwLength is number, initialSpacing is number, finalSpacing is number, law is TransitionLaw) returns map
+{
+    // First pass: coarse pitch sampling to estimate total angle traversed,
+    // so we can pick a station density that keeps the per-station angular
+    // step small enough for a manifold-safe loft (see MANIFOLD_MAX_ANGLE_STEP
+    // in the validation module) without over-sampling a screw that barely
+    // turns at all.
+    const coarseSamples = 64;
+    var coarseTheta = 0 * radian;
+    var pPrev = evaluateSpacing(0.0, initialSpacing, finalSpacing, law);
+    for (var i = 1; i <= coarseSamples; i += 1)
+    {
+        const uCur = i / coarseSamples;
+        const pCur = evaluateSpacing(uCur, initialSpacing, finalSpacing, law);
+        const dz = screwLength / coarseSamples;
+        // trapezoidal average of local angular rate over this slice
+        const rateAvg = (2 * PI / pPrev + 2 * PI / pCur) / 2; // radians per length, times radian handled below
+        coarseTheta += rateAvg * dz * radian;
+        pPrev = pCur;
+    }
+    const estimatedTurns = coarseTheta / (2 * PI * radian);
+
+    // Station density: target ~24 stations per turn (15 degree steps),
+    // clamped to a safe/practical range regardless of how many or how few
+    // turns the geometry works out to.
+    const stationsPerTurn = 24;
+    const minStations = 40;
+    const maxStations = 720;
+    const stationCount = round(clampScalar(estimatedTurns * stationsPerTurn, minStations, maxStations));
+
+    // Second pass: Simpson's-rule-style fine integration of theta(z) using
+    // the station density just computed, storing the full station table.
+    var stations = [];
+    var thetaAccum = 0 * radian;
+    var pLast = evaluateSpacing(0.0, initialSpacing, finalSpacing, law);
+    stations = append(stations, { "u" : 0.0, "z" : 0 * meter, "theta" : 0 * radian, "pitch" : pLast });
+
+    for (var i = 1; i <= stationCount; i += 1)
+    {
+        const uCur = i / stationCount;
+        const zCur = uCur * screwLength;
+        const pCur = evaluateSpacing(uCur, initialSpacing, finalSpacing, law);
+        const dz = screwLength / stationCount;
+        const rateAvg = (2 * PI / pLast + 2 * PI / pCur) / 2;
+        thetaAccum += rateAvg * dz * radian;
+        stations = append(stations, { "u" : uCur, "z" : zCur, "theta" : thetaAccum, "pitch" : pCur });
+        pLast = pCur;
+    }
+
+    return { "stations" : stations, "totalTurns" : estimatedTurns, "stationCount" : stationCount };
+}
+
+
+// ============================================================================
+// MODULE: VALIDATION
+// Everything here either returns a clean derived value or throws a
+// regeneration error that points at a specific input, so the user gets
+// actionable feedback instead of a generic kernel failure.
+// ============================================================================
+
+// Safety threshold: beyond this angular step per loft station, consecutive
+// cross-sections are far enough apart in angle that the loft can twist
+// through itself, producing self-intersecting / non-manifold geometry.
+const MANIFOLD_MAX_ANGLE_STEP = 15 * degree;
+
+// 3D-printing floor: below this, FDM nozzles (~0.4 mm) cannot reliably lay
+// down a continuous wall, and resin printers will produce a fragile flight
+// prone to snapping during support removal.
+const MIN_PRINTABLE_WALL = 1.2 * millimeter;
+
+function validateTopLevelInputs(definition is map)
+{
+    if (definition.finalSpacing <= 0 * meter || definition.initialSpacing <= 0 * meter)
+    {
+        throw regenError("Initial and final bottle spacing must both be greater than zero.", ["initialSpacing", "finalSpacing"]);
+    }
+    if (definition.bottleDiameter <= 0 * meter)
+    {
+        throw regenError("Bottle diameter must be greater than zero.", ["bottleDiameter"]);
+    }
+    if (definition.screwLength <= 0 * meter)
+    {
+        throw regenError("Screw length must be greater than zero.", ["screwLength"]);
+    }
+    // Screw should span meaningfully more than a single pitch, otherwise
+    // "progressive spacing" has no room to develop.
+    const roughMinPitch = min(definition.initialSpacing, definition.finalSpacing);
+    if (definition.screwLength < 1.5 * roughMinPitch)
+    {
+        throw regenError("Screw length is too short relative to the bottle spacing to form a usable spacing transition. Increase screw length or reduce spacing.", ["screwLength"]);
+    }
+}
+
+/**
+ * Resolves shaft diameter, flight height, and flight thickness from either
+ * user overrides or bottle-geometry-driven defaults, and checks that the
+ * result is physically buildable (no flight self-collision, no shaft
+ * bigger than the available spacing, no sub-printable walls).
+ */
+function resolveAndValidateSizing(definition is map, minPitch is number) returns map
+{
+    const bottleRadius = definition.bottleDiameter / 2;
+    const engagingRadius = max(bottleRadius - definition.bottleClearance, 1 * millimeter);
+
+    // --- Shaft diameter ---
+    var shaftDiameter = 0.32 * definition.bottleDiameter; // engineering default
+    if (definition.useShaftDiameterOverride)
+    {
+        shaftDiameter = definition.shaftDiameterOverride;
+    }
+    const shaftRadius = shaftDiameter / 2;
+
+    // --- Flight height ---
+    // Engagement fraction of 0.55 keeps the flight tall enough to
+    // positively contact and steer the bottle without approaching the
+    // bottle's full diameter (which would over-constrain it and risk
+    // jamming as spacing changes).
+    const engagementFraction = 0.55;
+    const flightHeight = engagementFraction * engagingRadius;
+    const flightOuterRadius = shaftRadius + flightHeight;
+
+    if (flightOuterRadius * 2 >= minPitch)
+    {
+        throw regenError("The flight's outer diameter is larger than the tightest bottle spacing, so consecutive flight wraps would collide. Reduce bottle diameter, increase initial spacing, or use the shaft diameter override to shrink the shaft.", ["bottleDiameter", "initialSpacing", "shaftDiameterOverride"]);
+    }
+
+    // --- Flight thickness ---
+    var flightThickness = max(MIN_PRINTABLE_WALL, 0.12 * minPitch);
+    if (definition.useFlightThicknessOverride)
+    {
+        flightThickness = definition.flightThicknessOverride;
+    }
+    if (flightThickness < MIN_PRINTABLE_WALL)
+    {
+        throw regenError("Flight thickness is below the minimum printable wall thickness (1.2 mm) and would not print reliably on FDM or resin printers.", ["flightThicknessOverride"]);
+    }
+    if (flightThickness > 0.35 * minPitch)
+    {
+        throw regenError("Flight thickness is too large relative to the tightest bottle spacing; successive flight wraps would touch or overlap, producing non-manifold geometry. Reduce flight thickness or increase spacing.", ["flightThicknessOverride", "initialSpacing"]);
+    }
+
+    if (shaftRadius <= 0 * meter)
+    {
+        throw regenError("Shaft diameter must be greater than zero.", ["shaftDiameterOverride"]);
+    }
+
+    return {
+        "shaftRadius" : shaftRadius,
+        "flightHeight" : flightHeight,
+        "flightThickness" : flightThickness
+    };
+}
+
+/** Confirms the station table is fine enough to keep the loft manifold-safe. */
+function validateStationResolution(stationTable is map, screwLength is number)
+{
+    const stations = stationTable.stations;
+    const n = size(stations);
+    for (var i = 1; i < n; i += 1)
+    {
+        const dTheta = abs(stations[i].theta - stations[i - 1].theta);
+        if (dTheta > MANIFOLD_MAX_ANGLE_STEP)
+        {
+            throw regenError("Internal resolution error: computed helix angle step exceeded the manifold-safety threshold. This should not happen with default settings -- try a smaller ratio between initial and final spacing, or a longer screw length.", ["screwLength"]);
+        }
+    }
+}
+
+
+// ============================================================================
+// MODULE: GEOMETRY
+// ============================================================================
+
+/**
+ * Builds the central shaft as a plain cylinder along +Z from the origin,
+ * via a circular sketch on the base plane extruded the full screw length.
+ * (A sketch + opExtrude is used instead of a direct cylinder primitive,
+ * since it is the most stable, version-independent way to get a solid
+ * cylinder in FeatureScript.)
+ */
+function buildShaft(context is Context, id is Id, shaftRadius is number, screwLength is number) returns Query
+{
+    const sketchId = id + "shaftSketch";
+    const basePlane = plane(vector(0, 0, 0) * meter, vector(0, 0, 1));
+    const sketch = newSketchOnPlane(context, sketchId, { "sketchPlane" : basePlane });
+    skCircle(sketch, "circle", {
+        "center" : vector(0, 0) * meter,
+        "radius" : shaftRadius
+    });
+    skSolve(sketch);
+
+    const extrudeId = id + "shaftExtrude";
+    opExtrude(context, extrudeId, {
+        "entities" : qSketchRegion(sketchId, false),
+        "direction" : vector(0, 0, 1),
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : screwLength
+    });
+
+    return qCreatedBy(extrudeId, EntityType.BODY);
+}
+
+/**
+ * Builds a single rectangular flight cross-section at a given station,
+ * lying in the "meridian" plane at that station's helix angle (the plane
+ * containing the screw axis and the radial direction at angle theta).
+ * The rectangle spans [shaftRadius, shaftRadius + height] radially and
+ * [z - t/2, z + t/2] axially. Returns a sketch-region query usable as one
+ * loft profile.
+ */
+function buildFlightCrossSection(context is Context, id is Id, station is map, shaftRadius is number, flightHeight is number, flightThickness is number, blendFraction is number) returns Query
+{
+    const theta = station.theta;
+    const z = station.z;
+    const envelope = entryExitEnvelope(station.u, blendFraction);
+    const localHeight = max(flightHeight * envelope, MIN_PRINTABLE_WALL * 0.5);
+
+    const radialDir = vector(cos(theta), sin(theta), 0);
+    const tangentialDir = vector(-sin(theta), cos(theta), 0);
+    const axialDir = vector(0, 0, 1);
+    const origin = vector(0, 0, 1) * z; // point on axis at this z
+
+    const sectionPlane = plane(origin, tangentialDir, radialDir);
+
+    const sketchId = id + "sk";
+    const sketch = newSketchOnPlane(context, sketchId, { "sketchPlane" : sectionPlane });
+
+    // Rectangle corners expressed in the plane's local (x = radial, y = axial)
+    // coordinates: x in [shaftRadius, shaftRadius + localHeight], y in
+    // [-flightThickness/2, flightThickness/2].
+    skRectangle(sketch, "rect", {
+        "firstCorner" : vector(shaftRadius, -flightThickness / 2),
+        "secondCorner" : vector(shaftRadius + localHeight, flightThickness / 2)
+    });
+
+    skSolve(sketch);
+
+    return qSketchRegion(sketchId, false);
+}
+
+/**
+ * Builds the full helical flight by lofting through every station's
+ * cross-section in sequence. Because consecutive stations are within
+ * MANIFOLD_MAX_ANGLE_STEP of each other (enforced in validation), the loft
+ * interpolates a smooth, continuous helicoid ribbon rather than the
+ * individual flat facets you'd get if the step were coarse.
+ */
+function buildFlightSolid(context is Context, id is Id, stationTable is map, shaftRadius is number, flightHeight is number, flightThickness is number, blendFraction is number) returns Query
+{
+    const stations = stationTable.stations;
+    var profiles = [];
+    for (var i = 0; i < size(stations); i += 1)
+    {
+        const stationId = id + ("stn" ~ i);
+        const profile = buildFlightCrossSection(context, stationId, stations[i], shaftRadius, flightHeight, flightThickness, blendFraction);
+        profiles = append(profiles, profile);
+    }
+
+    const loftId = id + "flightLoft";
+    opLoft(context, loftId, {
+        "profileSubqueries" : profiles
+    });
+
+    return qCreatedBy(loftId, EntityType.BODY);
+}
+
+/** Unions the flight ribbon with the shaft into a single watertight solid. */
+function unionScrewBody(context is Context, id is Id, shaftBody is Query, flightBody is Query) returns Query
+{
+    const unionId = id + "union";
+    opBoolean(context, unionId, {
+        "tools" : qUnion([shaftBody, flightBody]),
+        "operationType" : BooleanOperationType.UNION
+    });
+    return qCreatedBy(unionId, EntityType.BODY);
+}
+
+/**
+ * Best-effort cosmetic/printability fillet at the flight root (where the
+ * flight meets the shaft). This is treated as non-fatal: on the geometric
+ * corner cases a fully general fillet can fail even on valid manifold
+ * solids, and failing the whole feature over a cosmetic radius would be
+ * worse than simply skipping it.
+ */
+function applyRootFillet(context is Context, id is Id, bodyBeforeFillet is Query, flightThickness is number)
+{
+    const filletRadius = min(0.2 * flightThickness, 0.5 * millimeter);
+    if (filletRadius <= 0 * meter)
+    {
+        return;
+    }
+    try
+    {
+        opFillet(context, id + "rootFillet", {
+            "entities" : qOwnedByBody(bodyBeforeFillet, EntityType.EDGE),
+            "radius" : filletRadius
+        });
+    }
+    catch
+    {
+        // Non-fatal: proceed without the cosmetic fillet.
+    }
+}
+
+
+// ============================================================================
+// FEATURE DEFINITION
+// ============================================================================
+
+annotation { "Feature Type Name" : "Bottle Spacing Screw" }
+export const bottleSpacingScrew = defineFeature(function(context is Context, id is Id, definition is map)
+    precondition
+    {
+        // ---------------- GENERAL ----------------
+        annotation { "Name" : "Bottle diameter", "UIHint" : UIHint.SHOW_LABEL }
+        isLength(definition.bottleDiameter, BOTTLE_DIAMETER_BOUNDS);
+
+        annotation { "Name" : "Initial bottle spacing" }
+        isLength(definition.initialSpacing, SPACING_BOUNDS);
+
+        annotation { "Name" : "Final bottle spacing" }
+        isLength(definition.finalSpacing, SPACING_BOUNDS);
+
+        annotation { "Name" : "Screw length" }
+        isLength(definition.screwLength, SCREW_LENGTH_BOUNDS);
+
+        // ---------------- ADVANCED ----------------
+        annotation { "Name" : "Advanced", "UIHint" : UIHint.OPPOSITE_DIRECTION_CIRCULAR }
+        {
+            annotation { "Name" : "Transition law" }
+            definition.transitionLaw is TransitionLaw;
+
+            annotation { "Name" : "Bottle clearance" }
+            isLength(definition.bottleClearance, CLEARANCE_BOUNDS);
+
+            annotation { "Name" : "Override shaft diameter" }
+            definition.useShaftDiameterOverride is boolean;
+
+            if (definition.useShaftDiameterOverride)
+            {
+                annotation { "Name" : "Shaft diameter" }
+                isLength(definition.shaftDiameterOverride, OVERRIDE_LENGTH_BOUNDS);
+            }
+
+            annotation { "Name" : "Override flight thickness" }
+            definition.useFlightThicknessOverride is boolean;
+
+            if (definition.useFlightThicknessOverride)
+            {
+                annotation { "Name" : "Flight thickness" }
+                isLength(definition.flightThicknessOverride, OVERRIDE_LENGTH_BOUNDS);
+            }
+        }
+    }
+    {
+        // ---- 1. Validate raw inputs ----
+        validateTopLevelInputs(definition);
+
+        const minPitch = min(definition.initialSpacing, definition.finalSpacing);
+
+        // ---- 2. Resolve sizing (defaults or overrides) and validate fit ----
+        const sizing = resolveAndValidateSizing(definition, minPitch);
+
+        // ---- 3. Build the variable-pitch station table (the math core) ----
+        const stationTable = buildStationTable(
+            definition.screwLength,
+            definition.initialSpacing,
+            definition.finalSpacing,
+            definition.transitionLaw
+        );
+        validateStationResolution(stationTable, definition.screwLength);
+
+        // Entry/exit blend length ~= one local pitch at each end, capped so
+        // it never eats more than 15% of the screw from either side.
+        const blendFraction = clampScalar(minPitch / definition.screwLength, 0.02, 0.15);
+
+        // ---- 4. Build geometry ----
+        try
+        {
+            const shaftBody = buildShaft(context, id, sizing.shaftRadius, definition.screwLength);
+            const flightBody = buildFlightSolid(
+                context, id,
+                stationTable,
+                sizing.shaftRadius,
+                sizing.flightHeight,
+                sizing.flightThickness,
+                blendFraction
+            );
+            const screwBody = unionScrewBody(context, id, shaftBody, flightBody);
+            applyRootFillet(context, id, screwBody, sizing.flightThickness);
+
+            setProperty(context, {
+                "entities" : screwBody,
+                "propertyType" : PropertyType.NAME,
+                "value" : "Bottle Spacing Screw"
+            });
+        }
+        catch
+        {
+            throw regenError("Failed to generate a valid screw solid from these inputs. This usually means the spacing ratio, screw length, or thickness overrides push the flight geometry into self-intersection. Try increasing screw length, reducing the spacing ratio, or clearing manual overrides to use engineering defaults.", ["screwLength", "initialSpacing", "finalSpacing"]);
+        }
+    });
 
