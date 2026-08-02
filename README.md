@@ -1,5 +1,5 @@
 # Bottling-Spacing-Screw-Generator
-B-S-S-G
+B-S-S-G.
 A fully parametric Bottle Spacing Screw Generator
 for Onshape FeatureScript. Designed to make easier for engineers and bottling companies make and replace spacing screws easier and mor efficient.
 
